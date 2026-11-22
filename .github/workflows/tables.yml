@@ -1,0 +1,152 @@
+# The phone tables' release workflow. This file belongs to the `magnetite-tables` repository and
+# is copied there as `.github/workflows/tables.yml`; it is kept in Magnetite so both live in one
+# review.
+#
+# It prepares Magnetite's resources on a PC (Mojang's exporters need a JDK, which a phone has
+# not), keeps every file of the prepared folder that is not Mojang's, and publishes that as a
+# release of magnetite-tables. Nothing of Mojang's is attached: the small tables only, plus
+# `setup.json`, which names the client jar and asset index the phone downloads from Mojang itself.
+name: tables
+
+on:
+  workflow_dispatch:
+    inputs:
+      magnetite_ref:
+        description: The Magnetite revision to prepare from (a branch, tag or commit)
+        required: false
+        default: main
+        type: string
+
+# The release is created here, in magnetite-tables, with the run's own token.
+permissions:
+  contents: write
+
+concurrency:
+  group: tables
+  cancel-in-progress: false
+
+env:
+  # The version this workflow makes tables for; also part of the asset's name.
+  MINECRAFT: "26.3"
+
+jobs:
+  tables:
+    name: Prepare, classify and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out Magnetite at the requested ref
+        uses: actions/checkout@v4
+        with:
+          repository: izrikmizrik/Magnetite
+          ref: ${{ inputs.magnetite_ref }}
+          path: magnetite
+          fetch-depth: 1
+
+      - name: The Magnetite revision and the asset's name
+        id: revision
+        run: |
+          sha="$(git -C magnetite rev-parse --short=12 HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "asset=magnetite-tables-${MINECRAFT}-$sha.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Java 25, which the exporters compile and run on
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          java-package: jdk
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: magnetite
+
+      - name: Build the preparer
+        working-directory: magnetite
+        run: cargo build --release --locked -p horizon-prepare
+
+      - name: Fetch the pinned Minecraft from Mojang
+        # Eight downloads at a time, each checked against research-lock.json's sha1: the client
+        # and server jars, the libraries, the asset index and its objects. No account, no upload.
+        run: python3 -I magnetite/tools/fetch_minecraft.py mc
+
+      - name: Prepare the resources
+        working-directory: magnetite
+        # --prepare imports the pinned jars, libraries and version JSON from the files fetched
+        # above (no launcher install is read when each is named). --complete copies the sounds,
+        # then refuses to finish unless --check passes, so the folder is whole — which is what
+        # makes it comparable to what a phone assembles. Checkout put the fetcher's folder beside
+        # this one, so the paths lead out of `magnetite/`.
+        run: |
+          target/release/horizon-prepare \
+            --prepare \
+            --root . \
+            --version-json ../mc/version.json \
+            --client-jar ../mc/client.jar \
+            --server-jar ../mc/server.jar \
+            --libraries-dir ../mc/libraries \
+            --assets-dir ../mc/assets \
+            --java-home "$JAVA_HOME" \
+            --output ../prepared \
+            --complete
+
+      - name: The tables zip
+        # The prepared world generation templates are Mojang's bytes under other names: they are
+        # not published, and setup.json's `copies` has the phone copy them from its own jar.
+        run: |
+          python3 -I magnetite/tools/make_tables.py \
+            prepared mc "${{ steps.revision.outputs.asset }}"
+
+      - name: The zip's sha256
+        id: digest
+        run: echo "sha256=$(sha256sum '${{ steps.revision.outputs.asset }}' | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release in this repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="tables-${{ steps.revision.outputs.sha }}"
+          notes="The prepared tables a phone installs from, made by izrikmizrik/Magnetite@${{ steps.revision.outputs.sha }}. No Mojang file is attached: \`setup.json\` names the client jar and asset index the phone downloads from Mojang itself."
+          # A re-run of the same revision uploads to the release it already made.
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$tag" "${{ steps.revision.outputs.asset }}" \
+              --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$tag" "${{ steps.revision.outputs.asset }}" \
+              --repo "${{ github.repository }}" \
+              --title "Tables for Minecraft ${MINECRAFT}, Magnetite ${{ steps.revision.outputs.sha }}" \
+              --notes "$notes"
+          fi
+
+      - name: The address and hash Magnetite's variables take
+        run: |
+          tag="tables-${{ steps.revision.outputs.sha }}"
+          url="https://github.com/${{ github.repository }}/releases/download/$tag/${{ steps.revision.outputs.asset }}"
+          {
+            echo "## Tables for Minecraft ${MINECRAFT}"
+            echo
+            echo "Magnetite ${{ steps.revision.outputs.sha }}, prepared on this runner; no Mojang file is attached."
+            echo
+            echo "Set these repository variables in Magnetite:"
+            echo
+            echo '```'
+            echo "MAGNETITE_TABLES_URL=$url"
+            echo "MAGNETITE_TABLES_SHA256=${{ steps.digest.outputs.sha256 }}"
+            echo '```'
+            echo
+            echo "Release: https://github.com/${{ github.repository }}/releases/tag/$tag"
+            echo
+            echo "Asset: $url"
+            echo
+            echo "sha256: \`${{ steps.digest.outputs.sha256 }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: The file and its hash
+        run: |
+          ls -l "${{ steps.revision.outputs.asset }}"
+          sha256sum "${{ steps.revision.outputs.asset }}"
